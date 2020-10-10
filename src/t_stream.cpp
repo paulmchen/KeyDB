@@ -43,6 +43,7 @@
 void streamFreeCG(streamCG *cg);
 void streamFreeNACK(streamNACK *na);
 size_t streamReplyWithRangeFromConsumerPEL(client *c, stream *s, streamID *start, streamID *end, size_t count, streamConsumer *consumer);
+bool FInReplicaReplay();
 
 /* -----------------------------------------------------------------------
  * Low level stream encoding: a radix tree of listpacks.
@@ -838,6 +839,9 @@ void streamPropagateXCLAIM(client *c, robj *key, streamCG *group, robj *groupnam
      *
      * Note that JUSTID is useful in order to avoid that XCLAIM will do
      * useless work in the replica side, trying to fetch the stream item. */
+    if (FInReplicaReplay())
+        return;
+
     robj *argv[14];
     argv[0] = createStringObject("XCLAIM",6);
     argv[1] = key;
@@ -1847,6 +1851,7 @@ NULL
             o = createStreamObject();
             dbAdd(c->db,c->argv[2],o);
             s = (stream*)ptrFromObj(o);
+            signalModifiedKey(c,c->db,c->argv[2]);
         }
 
         streamCG *cg = streamCreateCG(s,grpname,sdslen(grpname),&id);
@@ -1891,7 +1896,7 @@ NULL
         g_pserver->dirty++;
         notifyKeyspaceEvent(NOTIFY_STREAM,"xgroup-delconsumer",
                             c->argv[2],c->db->id);
-    } else if (!strcasecmp(opt,"HELP")) {
+    } else if (c->argc == 2 && !strcasecmp(opt,"HELP")) {
         addReplyHelp(c, help);
     } else {
         addReplySubcommandSyntaxError(c);

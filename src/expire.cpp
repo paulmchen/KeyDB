@@ -80,7 +80,7 @@ void activeExpireCycleExpire(redisDb *db, expireEntry &e, long long now) {
     robj *val = (robj*)dictGetVal(de);
     int deleted = 0;
 
-    robj objKey;
+    redisObjectStack objKey;
     initStaticStringObject(objKey, (char*)e.key());
     bool fTtlChanged = false;
 
@@ -145,7 +145,7 @@ void activeExpireCycleExpire(redisDb *db, expireEntry &e, long long now) {
             serverAssert(false);
         }
         
-        robj objSubkey;
+        redisObjectStack objSubkey;
         initStaticStringObject(objSubkey, (char*)pfat->nextExpireEntry().spsubkey.get());
         propagateSubkeyExpire(db, val->type, &objKey, &objSubkey);
         
@@ -575,6 +575,16 @@ void flushSlaveKeysWithExpireList(void) {
     }
 }
 
+int checkAlreadyExpired(long long when) {
+    /* EXPIRE with negative TTL, or EXPIREAT with a timestamp into the past
+     * should never be executed as a DEL when load the AOF or in the context
+     * of a slave instance.
+     *
+     * Instead we add the already expired key to the database with expire time
+     * (possibly in the past) and wait for an explicit DEL from the master. */
+    return (when <= mstime() && !g_pserver->loading && (!listLength(g_pserver->masters) || g_pserver->fActiveReplica));
+}
+
 /*-----------------------------------------------------------------------------
  * Expires Commands
  *----------------------------------------------------------------------------*/
@@ -602,13 +612,7 @@ void expireGenericCommand(client *c, long long basetime, int unit) {
         return;
     }
 
-    /* EXPIRE with negative TTL, or EXPIREAT with a timestamp into the past
-     * should never be executed as a DEL when load the AOF or in the context
-     * of a replica instance.
-     *
-     * Instead we take the other branch of the IF statement setting an expire
-     * (possibly in the past) and wait for an explicit DEL from the master. */
-    if (when <= mstime() && !g_pserver->loading && (!listLength(g_pserver->masters) || g_pserver->fActiveReplica)) {
+    if (checkAlreadyExpired(when)) {
         robj *aux;
 
         int deleted = g_pserver->lazyfree_lazy_expire ? dbAsyncDelete(c->db,key) :
@@ -715,6 +719,7 @@ void persistCommand(client *c) {
     if (lookupKeyWrite(c->db,c->argv[1])) {
         if (c->argc == 2) {
             if (removeExpire(c->db,c->argv[1])) {
+                signalModifiedKey(c,c->db,c->argv[1]);
                 notifyKeyspaceEvent(NOTIFY_GENERIC,"persist",c->argv[1],c->db->id);
                 addReply(c,shared.cone);
                 g_pserver->dirty++;
@@ -723,6 +728,7 @@ void persistCommand(client *c) {
             }
         } else if (c->argc == 3) {
             if (removeSubkeyExpire(c->db, c->argv[1], c->argv[2])) {
+                signalModifiedKey(c,c->db,c->argv[1]);
                 notifyKeyspaceEvent(NOTIFY_GENERIC,"persist",c->argv[1],c->db->id);
                 addReply(c,shared.cone);
                 g_pserver->dirty++;
@@ -745,3 +751,90 @@ void touchCommand(client *c) {
     addReplyLongLong(c,touched);
 }
 
+expireEntryFat::~expireEntryFat()
+{
+    if (m_dictIndex != nullptr)
+        dictRelease(m_dictIndex);
+}
+
+void expireEntryFat::createIndex()
+{
+    serverAssert(m_dictIndex == nullptr);
+    m_dictIndex = dictCreate(&keyptrDictType, nullptr);
+
+    for (auto &entry : m_vecexpireEntries)
+    {
+        if (entry.spsubkey != nullptr)
+        {
+            dictEntry *de = dictAddRaw(m_dictIndex, (void*)entry.spsubkey.get(), nullptr);
+            de->v.s64 = entry.when;
+        }
+    }
+}
+
+void expireEntryFat::expireSubKey(const char *szSubkey, long long when)
+{
+    if (m_vecexpireEntries.size() >= INDEX_THRESHOLD && m_dictIndex == nullptr)
+        createIndex();
+
+    // First check if the subkey already has an expiration
+    if (m_dictIndex != nullptr && szSubkey != nullptr)
+    {
+        dictEntry *de = dictFind(m_dictIndex, szSubkey);
+        if (de != nullptr)
+        {
+            auto itr = std::lower_bound(m_vecexpireEntries.begin(), m_vecexpireEntries.end(), de->v.u64);
+            while (itr != m_vecexpireEntries.end() && itr->when == de->v.s64)
+            {
+                bool fFound = false;
+                if (szSubkey == nullptr && itr->spsubkey == nullptr) {
+                    fFound = true;
+                } else if (szSubkey != nullptr && itr->spsubkey != nullptr && sdscmp((sds)itr->spsubkey.get(), (sds)szSubkey) == 0) {
+                    fFound = true;
+                }
+                if (fFound) {
+                    m_vecexpireEntries.erase(itr);
+                    dictDelete(m_dictIndex, szSubkey);
+                    break;
+                }
+                ++itr;
+            }
+        }
+    }
+    else
+    {
+        for (auto &entry : m_vecexpireEntries)
+        {
+            if (szSubkey != nullptr)
+            {
+                // if this is a subkey expiry then its not a match if the expireEntry is either for the
+                //  primary key or a different subkey
+                if (entry.spsubkey == nullptr || sdscmp((sds)entry.spsubkey.get(), (sds)szSubkey) != 0)
+                    continue;
+            }
+            else
+            {
+                if (entry.spsubkey != nullptr)
+                    continue;
+            }
+            m_vecexpireEntries.erase(m_vecexpireEntries.begin() + (&entry - m_vecexpireEntries.data()));
+            break;
+        }
+    }
+    auto itrInsert = std::lower_bound(m_vecexpireEntries.begin(), m_vecexpireEntries.end(), when);
+    const char *subkey = (szSubkey) ? sdsdup(szSubkey) : nullptr;
+    auto itr = m_vecexpireEntries.emplace(itrInsert, when, subkey);
+    if (m_dictIndex && subkey) {
+        dictEntry *de = dictAddRaw(m_dictIndex, (void*)itr->spsubkey.get(), nullptr);
+        de->v.s64 = when;
+    }
+}
+
+void expireEntryFat::popfrontExpireEntry()
+{ 
+    if (m_dictIndex != nullptr && m_vecexpireEntries.begin()->spsubkey) {
+        int res = dictDelete(m_dictIndex, (void*)m_vecexpireEntries.begin()->spsubkey.get());
+        serverAssert(res == DICT_OK);
+    }
+    m_vecexpireEntries.erase(m_vecexpireEntries.begin());
+}
