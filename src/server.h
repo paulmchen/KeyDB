@@ -327,6 +327,7 @@ inline bool operator!=(const void *p, const robj_sharedptr &rhs)
 #define PROTO_MAX_QUERYBUF_LEN  (1024*1024*1024) /* 1GB max query buffer. */
 #define PROTO_IOBUF_LEN         (1024*16)  /* Generic I/O buffer size */
 #define PROTO_REPLY_CHUNK_BYTES (16*1024) /* 16k output buffer */
+#define PROTO_ASYNC_REPLY_CHUNK_BYTES (1024)
 #define PROTO_INLINE_MAX_SIZE   (1024*64) /* Max size of inline reads */
 #define PROTO_MBULK_BIG_ARG     (1024*32)
 #define LONG_STR_SIZE      21          /* Bytes needed for long -> str + '\0' */
@@ -1082,7 +1083,7 @@ typedef struct client {
     std::atomic<uint64_t> flags;              /* Client flags: CLIENT_* macros. */
     int casyncOpsPending;
     int fPendingAsyncWrite; /* NOTE: Not a flag because it is written to outside of the client lock (locked by the global lock instead) */
-    int fPendingAsyncWriteHandler;
+    std::atomic<bool> fPendingAsyncWriteHandler;
     int authenticated;      /* Needed when the default user requires auth. */
     int replstate;          /* Replication state if this is a replica. */
     int repl_put_online_on_ack; /* Install replica write handler on ACK. */
@@ -1145,16 +1146,14 @@ typedef struct client {
     char buf[PROTO_REPLY_CHUNK_BYTES];
 
     /* Async Response Buffer - other threads write here */
-    int bufposAsync;
-    int buflenAsync;
-    char *bufAsync;
+    clientReplyBlock *replyAsync;
 
     int iel; /* the event loop index we're registered with */
     struct fastlock lock;
     int master_error;
 
     // post a function from a non-client thread to run on its client thread
-    bool postFunction(std::function<void(client *)> fn);
+    bool postFunction(std::function<void(client *)> fn, bool fLock = true);
 } client;
 
 struct saveparam {
@@ -2005,17 +2004,14 @@ void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void acceptTLSHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void acceptUnixHandler(aeEventLoop *el, int fd, void *privdata, int mask);
 void readQueryFromClient(connection *conn);
-void addReplyNull(client *c, robj_roptr objOldProtocol = nullptr);
+void addReplyNull(client *c);
 void addReplyNullArray(client *c);
-void addReplyNullArrayAsync(client *c);
 void addReplyBool(client *c, int b);
 void addReplyVerbatim(client *c, const char *s, size_t len, const char *ext);
-void addReplyVerbatimAsync(client *c, const char *s, size_t len, const char *ext);
 void addReplyProto(client *c, const char *s, size_t len);
 void addReplyBulk(client *c, robj_roptr obj);
 void AddReplyFromClient(client *c, client *src);
 void addReplyBulkCString(client *c, const char *s);
-void addReplyBulkCStringAsync(client *c, const char *s);
 void addReplyBulkCBuffer(client *c, const void *p, size_t len);
 void addReplyBulkLongLong(client *c, long long ll);
 void addReply(client *c, robj_roptr obj);
@@ -2027,10 +2023,9 @@ void addReplyError(client *c, const char *err);
 void addReplyStatus(client *c, const char *status);
 void addReplyDouble(client *c, double d);
 void addReplyHumanLongDouble(client *c, long double d);
-void addReplyHumanLongDoubleAsync(client *c, long double d);
 void addReplyLongLong(client *c, long long ll);
 #ifdef __cplusplus
-void addReplyLongLongWithPrefixCore(client *c, long long ll, char prefix, bool fAsync);
+void addReplyLongLongWithPrefixCore(client *c, long long ll, char prefix);
 #endif
 void addReplyArrayLen(client *c, long length);
 void addReplyMapLen(client *c, long length);
@@ -2074,23 +2069,6 @@ int writeToClient(client *c, int handler_installed);
 void linkClient(client *c);
 void protectClient(client *c);
 void unprotectClient(client *c);
-
-// Special Thread-safe addReply() commands for posting messages to clients from a different thread
-void addReplyAsync(client *c, robj_roptr obj);
-void addReplyArrayLenAsync(client *c, long length);
-void addReplyProtoAsync(client *c, const char *s, size_t len);
-void addReplyBulkAsync(client *c, robj_roptr obj);
-void addReplyBulkCBufferAsync(client *c, const void *p, size_t len);
-void addReplyErrorAsync(client *c, const char *err);
-void addReplyMapLenAsync(client *c, long length);
-void addReplyNullAsync(client *c);
-void addReplyDoubleAsync(client *c, double d);
-void *addReplyDeferredLenAsync(client *c);
-void setDeferredArrayLenAsync(client *c, void *node, long length);
-void addReplySdsAsync(client *c, sds s);
-void addReplyBulkSdsAsync(client *c, sds s);
-void addReplyPushLenAsync(client *c, long length);
-void addReplyLongLongAsync(client *c, long long ll);
 
 void ProcessPendingAsyncWrites(void);
 client *lookupClientByID(uint64_t id);
