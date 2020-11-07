@@ -63,6 +63,7 @@
 #include <mutex>
 #include "aelocker.h"
 #include "motd.h"
+#include "t_nhash.h"
 #ifdef __linux__
 #include <sys/prctl.h>
 #endif
@@ -1060,7 +1061,15 @@ struct redisCommand redisCommandTable[] = {
     
     {"stralgo",stralgoCommand,-2,
      "read-only @string",
-     0,lcsGetKeys,0,0,0,0,0,0}
+     0,lcsGetKeys,0,0,0,0,0,0},
+
+    {"keydb.nhget",nhgetCommand,-2,
+     "read-only fast @hash",
+     0,NULL,1,1,1,0,0,0},
+    
+    {"keydb.nhset",nhsetCommand,-3,
+     "read-only fast @hash",
+     0,NULL,1,1,1,0,0,0},
 };
 
 /*============================ Utility functions ============================ */
@@ -2221,10 +2230,11 @@ void processClients();
  * The most important is freeClientsInAsyncFreeQueue but we also
  * call some other low-risk functions. */
 void beforeSleep(struct aeEventLoop *eventLoop) {
+    AeLocker locker;
     UNUSED(eventLoop);
     int iel = ielFromEventLoop(eventLoop);
     
-    aeAcquireLock();
+    locker.arm();
     processClients();
 
     /* Handle precise timeouts of blocked clients. */
@@ -2232,9 +2242,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     /* Handle TLS pending data. (must be done before flushAppendOnlyFile) */
     if (tlsHasPendingData()) {
-        aeReleaseLock();
+        locker.disarm();
         tlsProcessPendingData();
-        aeAcquireLock();
+        locker.arm();
     }
 
     /* If tls still has pending unread data don't sleep at all. */
@@ -2299,9 +2309,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
         first so perform it here */
     bool fSentReplies = false;
     if (listLength(g_pserver->clients_to_close)) {
-        aeReleaseLock();
+        locker.disarm();
         handleClientsWithPendingWrites(iel, aof_state);
-        aeAcquireLock();
+        locker.arm();
         fSentReplies = true;
     }
 
@@ -2311,7 +2321,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     /* Before we are going to sleep, let the threads access the dataset by
      * releasing the GIL. Redis main thread will not touch anything at this
      * time. */
-    aeReleaseLock();
+    locker.disarm();
     if (!fSentReplies)
         handleClientsWithPendingWrites(iel, aof_state);
     if (moduleCount()) moduleReleaseGIL(TRUE /*fServerThread*/);
@@ -3540,6 +3550,12 @@ void call(client *c, int flags) {
         replicationFeedMonitors(c,g_pserver->monitors,c->db->id,c->argv,c->argc);
     }
 
+    /* We need to transfer async writes before a client's repl state gets changed.  Otherwise
+        we won't be able to propogate them correctly. */
+    if (c->cmd->flags & CMD_CATEGORY_REPLICATION) {
+        ProcessPendingAsyncWrites();
+    }
+
     /* Initialization: clear the flags that must be set by the command on
      * demand, and initialize the array for additional commands propagation. */
     c->flags &= ~(CLIENT_FORCE_AOF|CLIENT_FORCE_REPL|CLIENT_PREVENT_PROP);
@@ -3549,8 +3565,17 @@ void call(client *c, int flags) {
     /* Call the command. */
     dirty = g_pserver->dirty;
     updateCachedTime(0);
+    incrementMvccTstamp();
     start = g_pserver->ustime;
-    c->cmd->proc(c);
+    try {
+        c->cmd->proc(c);
+    } catch (robj_roptr o) {
+        addReply(c, o);
+    } catch (robj *o) {
+        addReply(c, o);
+    } catch (const char *sz) {
+        addReplyError(c, sz);
+    }
     serverTL->commandsExecuted++;
     duration = ustime()-start;
     dirty = g_pserver->dirty-dirty;
@@ -3831,8 +3856,6 @@ int processCommand(client *c, int callFlags) {
             return C_OK;
         }
     }
-
-    incrementMvccTstamp();
 
     /* Handle the maxmemory directive.
      *
