@@ -107,7 +107,7 @@ endif
 FINAL_CFLAGS=$(STD) $(WARN) $(OPT) $(DEBUG) $(CFLAGS) $(REDIS_CFLAGS)
 FINAL_CXXFLAGS=$(CXX_STD) $(WARN) $(OPT) $(DEBUG) $(CXXFLAGS) $(REDIS_CFLAGS)
 FINAL_LDFLAGS=$(LDFLAGS) $(REDIS_LDFLAGS) $(DEBUG)
-FINAL_LIBS+=-lm -lcurl
+FINAL_LIBS+=-lm
 DEBUG=-g -ggdb
 
 ifneq ($(uname_S),Darwin)
@@ -171,8 +171,11 @@ else
 	# All the other OSes (notably Linux)
 	FINAL_LDFLAGS+= -rdynamic
 	FINAL_LIBS+=-ldl -pthread -lrt -luuid
+ifneq ($(NO_MOTD),yes)
 	FINAL_CFLAGS += -DMOTD
 	FINAL_CXXFLAGS += -DMOTD
+	FINAL_LIBS+=-lcurl
+endif
 endif
 endif
 endif
@@ -375,7 +378,7 @@ DEP = $(REDIS_SERVER_OBJ:%.o=%.d) $(REDIS_CLI_OBJ:%.o=%.d) $(REDIS_BENCHMARK_OBJ
 	$(KEYDB_AS) $< -o $@
 
 clean:
-	rm -rf $(REDIS_SERVER_NAME) $(REDIS_SENTINEL_NAME) $(REDIS_CLI_NAME) $(REDIS_BENCHMARK_NAME) $(REDIS_CHECK_RDB_NAME) $(REDIS_CHECK_AOF_NAME) *.o *.gcda *.gcno *.gcov redis.info lcov-html Makefile.dep dict-benchmark
+	rm -rf $(REDIS_SERVER_NAME) $(REDIS_SENTINEL_NAME) $(REDIS_CLI_NAME) $(REDIS_BENCHMARK_NAME) $(REDIS_CHECK_RDB_NAME) $(REDIS_CHECK_AOF_NAME) *.o *.gcda *.gcno *.gcov KeyDB.info lcov-html Makefile.dep dict-benchmark
 	rm -f $(DEP)
 
 .PHONY: clean
@@ -397,9 +400,10 @@ check: test
 
 lcov:
 	$(MAKE) gcov
-	@(set -e; cd ..; ./runtest --clients 1)
-	@geninfo -o redis.info .
-	@genhtml --legend -o lcov-html redis.info
+	@(set -e; cd ..; ./runtest --config server-threads 3; ./runtest-sentinel; ./runtest-cluster; ./runtest-moduleapi)
+	@geninfo -o KeyDB.info --no-external .
+	@genhtml --legend -o lcov-html KeyDB.info
+	@genhtml --legend -o lcov-html KeyDB.info | grep lines | awk '{print $$2;}' | sed 's/%//g'
 
 test-sds: sds.c sds.h
 	$(REDIS_CC) sds.c zmalloc.cpp -DSDS_TEST_MAIN $(FINAL_LIBS) -o /tmp/sds_test

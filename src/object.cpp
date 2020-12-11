@@ -310,8 +310,10 @@ void freeStringObject(robj_roptr o) {
 void freeListObject(robj_roptr o) {
     if (o->encoding == OBJ_ENCODING_QUICKLIST) {
         quicklistRelease((quicklist*)ptrFromObj(o));
+    } else if (o->encoding == OBJ_ENCODING_ZIPLIST) {
+        zfree(ptrFromObj(o));
     } else {
-        serverPanic("Unknown list encoding type");
+        serverPanic("Unknown list encoding type: %d", o->encoding);
     }
 }
 
@@ -1528,7 +1530,7 @@ void *allocPtrFromObj(robj_roptr o) {
 }
 
 robj *objFromAllocPtr(void *pv) {
-    if (g_pserver->fActiveReplica) {
+    if (pv != nullptr && g_pserver->fActiveReplica) {
         return reinterpret_cast<robj*>(reinterpret_cast<redisObjectExtended*>(pv)+1);
     } 
     return reinterpret_cast<robj*>(pv);

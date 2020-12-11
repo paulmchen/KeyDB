@@ -48,6 +48,7 @@ set ::all_tests {
     integration/replication-psync
     integration/replication-active
     integration/replication-multimaster
+    integration/replication-multimaster-connect
     integration/aof
     integration/rdb
     integration/convert-zipmap-hash-on-load
@@ -75,6 +76,7 @@ set ::all_tests {
     unit/tls
     unit/tracking
     unit/oom-score-adj
+    unit/loadsave
 }
 # Index to the next test to run in the ::all_tests list.
 set ::next_test 0

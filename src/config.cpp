@@ -2273,17 +2273,42 @@ static int updateMaxclients(long long val, long long prev, const char **err) {
             }
             return 0;
         }
-        for (int iel = 0; iel < MAX_EVENT_LOOPS; ++iel)
+        /* Change the SetSize for the current thread first. If any error, return the error message to the client, 
+         * otherwise, continue to do the same for other threads */
+        if ((unsigned int) aeGetSetSize(aeGetCurrentEventLoop()) <
+            g_pserver->maxclients + CONFIG_FDSET_INCR)
         {
+            if (aeResizeSetSize(aeGetCurrentEventLoop(),
+                g_pserver->maxclients + CONFIG_FDSET_INCR) == AE_ERR)
+            {
+                *err = "The event loop API used by Redis is not able to handle the specified number of clients";
+                return 0;
+            }
+            serverLog(LL_DEBUG,"Successfully changed the setsize for current thread %d", ielFromEventLoop(aeGetCurrentEventLoop()));
+        }
+
+        for (int iel = 0; iel < cserver.cthreads; ++iel)
+        {
+            if (g_pserver->rgthreadvar[iel].el == aeGetCurrentEventLoop()){
+                continue;
+            }
+
             if ((unsigned int) aeGetSetSize(g_pserver->rgthreadvar[iel].el) <
                 g_pserver->maxclients + CONFIG_FDSET_INCR)
             {
-                if (aeResizeSetSize(g_pserver->rgthreadvar[iel].el,
-                    g_pserver->maxclients + CONFIG_FDSET_INCR) == AE_ERR)
-                {
-                    *err = "The event loop API used by Redis is not able to handle the specified number of clients";
+                int res = aePostFunction(g_pserver->rgthreadvar[iel].el, [iel] {
+                    if (aeResizeSetSize(g_pserver->rgthreadvar[iel].el, g_pserver->maxclients + CONFIG_FDSET_INCR) == AE_ERR) {
+                        serverLog(LL_WARNING,"Failed to change the setsize for Thread %d", iel);
+                    }
+                });
+
+                if (res != AE_OK){
+                    static char msg[128];
+                    sprintf(msg, "Failed to post the request to change setsize for Thread %d", iel);
+                    *err = msg;
                     return 0;
                 }
+                serverLog(LL_DEBUG,"Successfully post the request to change the setsize for thread %d", iel);
             }
         }
     }
@@ -2344,6 +2369,7 @@ standardConfig configs[] = {
     createBoolConfig("daemonize", NULL, IMMUTABLE_CONFIG, cserver.daemonize, 0, NULL, NULL),
     createBoolConfig("lua-replicate-commands", NULL, MODIFIABLE_CONFIG, g_pserver->lua_always_replicate_commands, 1, NULL, NULL),
     createBoolConfig("always-show-logo", NULL, IMMUTABLE_CONFIG, g_pserver->always_show_logo, 0, NULL, NULL),
+    createBoolConfig("enable-motd", NULL, IMMUTABLE_CONFIG, cserver.enable_motd, 1, NULL, NULL),
     createBoolConfig("protected-mode", NULL, MODIFIABLE_CONFIG, g_pserver->protected_mode, 1, NULL, NULL),
     createBoolConfig("rdbcompression", NULL, MODIFIABLE_CONFIG, g_pserver->rdb_compression, 1, NULL, NULL),
     createBoolConfig("rdb-del-sync-files", NULL, MODIFIABLE_CONFIG, g_pserver->rdb_del_sync_files, 0, NULL, NULL),

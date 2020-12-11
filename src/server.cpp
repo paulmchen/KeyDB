@@ -1070,6 +1070,10 @@ struct redisCommand redisCommandTable[] = {
     {"keydb.nhset",nhsetCommand,-3,
      "read-only fast @hash",
      0,NULL,1,1,1,0,0,0},
+
+    {"KEYDB.MVCCRESTORE",mvccrestoreCommand, 5,
+     "write use-memory @keyspace @dangerous",
+     0,NULL,1,1,1,0,0,0},
 };
 
 /*============================ Utility functions ============================ */
@@ -2438,6 +2442,8 @@ void createSharedObjects(void) {
     shared.hdel = makeObjectShared(createStringObject("HDEL", 4));
     shared.zrem = makeObjectShared(createStringObject("ZREM", 4));
     shared.srem = makeObjectShared(createStringObject("SREM", 4));
+    shared.mvccrestore = makeObjectShared(createStringObject("KEYDB.MVCCRESTORE", 17));
+    shared.pexpirememberat = makeObjectShared(createStringObject("PEXPIREMEMBERAT",15));
     for (j = 0; j < OBJ_SHARED_INTEGERS; j++) {
         shared.integers[j] =
             makeObjectShared(createObject(OBJ_STRING,(void*)(long)j));
@@ -4019,8 +4025,8 @@ bool client::postFunction(std::function<void(client *)> fn, bool fLock) {
     this->casyncOpsPending++;
     return aePostFunction(g_pserver->rgthreadvar[this->iel].el, [this, fn]{
         std::lock_guard<decltype(this->lock)> lock(this->lock);
-        --casyncOpsPending;
         fn(this);
+        --casyncOpsPending;
     }, false, fLock) == AE_OK;
 }
 
@@ -5130,7 +5136,7 @@ void redisAsciiArt(void) {
             mode, g_pserver->port ? g_pserver->port : g_pserver->tls_port
         );
     } else {
-        sds motd = fetchMOTD(true);
+        sds motd = fetchMOTD(true, cserver.enable_motd);
         snprintf(buf,1024*16,ascii_logo,
             KEYDB_REAL_VERSION,
             redisGitSHA1(),
@@ -5689,7 +5695,7 @@ int main(int argc, char **argv) {
 
     validateConfiguration();
 
-    for (int iel = 0; iel < MAX_EVENT_LOOPS; ++iel)
+    for (int iel = 0; iel < cserver.cthreads; ++iel)
     {
         initServerThread(g_pserver->rgthreadvar+iel, iel == IDX_EVENT_LOOP_MAIN);
     }
@@ -5782,9 +5788,13 @@ int main(int argc, char **argv) {
     setOOMScoreAdj(-1);
     serverAssert(cserver.cthreads > 0 && cserver.cthreads <= MAX_EVENT_LOOPS);
     pthread_t rgthread[MAX_EVENT_LOOPS];
+
+    pthread_attr_t tattr;
+    pthread_attr_init(&tattr);
+    pthread_attr_setstacksize(&tattr, 1 << 23); // 8 MB
     for (int iel = 0; iel < cserver.cthreads; ++iel)
     {
-        pthread_create(rgthread + iel, NULL, workerThreadMain, (void*)((int64_t)iel));
+        pthread_create(rgthread + iel, &tattr, workerThreadMain, (void*)((int64_t)iel));
         if (cserver.fThreadAffinity)
         {
 #ifdef __linux__
