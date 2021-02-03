@@ -689,7 +689,7 @@ struct redisCommand redisCommandTable[] = {
      * failure detection, and a loading server is considered to be
      * not available. */
     {"ping",pingCommand,-1,
-     "ok-stale fast @connection @replication",
+     "ok-stale ok-loading fast @connection @replication",
      0,NULL,0,0,0,0,0,0},
 
     {"echo",echoCommand,2,
@@ -2757,7 +2757,7 @@ int setOOMScoreAdj(int process_class) {
     int val;
     char buf[64];
 
-    val = g_pserver->oom_score_adj_base + g_pserver->oom_score_adj_values[process_class];
+    val = g_pserver->oom_score_adj_values[process_class];
     if (g_pserver->oom_score_adj == OOM_SCORE_RELATIVE)
         val += g_pserver->oom_score_adj_base;
     if (val > 1000) val = 1000;
@@ -3773,13 +3773,14 @@ void call(client *c, int flags) {
  * If there's a transaction is flags it as dirty, and if the command is EXEC,
  * it aborts the transaction.
  * Note: 'reply' is expected to end with \r\n */
-void rejectCommand(client *c, robj *reply) {
+void rejectCommand(client *c, robj *reply, int severity = ERR_CRITICAL) {
     flagTransaction(c);
     if (c->cmd && c->cmd->proc == execCommand) {
         execCommandAbort(c, szFromObj(reply));
-    } else {
+    }
+    else {
         /* using addReplyError* rather than addReply so that the error can be logged. */
-        addReplyErrorObject(c, reply);
+        addReplyErrorObject(c, reply, severity);
     }
 }
 
@@ -4024,7 +4025,7 @@ int processCommand(client *c, int callFlags) {
         /* Active Replicas can execute read only commands, and optionally write commands */
         if (!(g_pserver->loading == LOADING_REPLICATION && g_pserver->fActiveReplica && ((c->cmd->flags & CMD_READONLY) || g_pserver->fWriteDuringActiveLoad)))
         {
-            rejectCommand(c, shared.loadingerr);
+            rejectCommand(c, shared.loadingerr, ERR_WARNING);
             return C_OK;
         }
     }
@@ -4086,7 +4087,7 @@ bool client::postFunction(std::function<void(client *)> fn, bool fLock) {
         std::lock_guard<decltype(this->lock)> lock(this->lock);
         fn(this);
         --casyncOpsPending;
-    }, false, fLock) == AE_OK;
+    }, fLock) == AE_OK;
 }
 
 /*================================== Shutdown =============================== */
@@ -4203,6 +4204,8 @@ int prepareForShutdown(int flags) {
     /* Best effort flush of replica output buffers, so that we hopefully
      * send them pending writes. */
     flushSlavesOutputBuffers();
+    g_pserver->repl_batch_idxStart = -1;
+    g_pserver->repl_batch_offStart = -1;
 
     /* Close the listening sockets. Apparently this allows faster restarts. */
     closeListeningSockets(1);
@@ -5177,7 +5180,7 @@ int linuxMadvFreeForkBugCheck(void) {
     const long map_size = 3 * 4096;
 
     /* Create a memory map that's in our full control (not one used by the allocator). */
-    p = mmap(NULL, map_size, PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    p = (char*)mmap(NULL, map_size, PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
     serverAssert(p != MAP_FAILED);
 
     q = p + 4096;
