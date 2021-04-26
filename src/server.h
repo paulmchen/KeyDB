@@ -441,10 +441,8 @@ extern int configOOMScoreAdjValuesDefaults[CONFIG_OOM_COUNT];
 #define CLIENT_PENDING_READ (1<<29) /* The client has pending reads and was put
                                        in the list of clients we can read
                                        from. */
-#define CLIENT_PENDING_COMMAND (1<<30) /* Used in threaded I/O to signal after
-                                          we return single threaded that the
-                                          client has already pending commands
-                                          to be executed. */
+#define CLIENT_EXECUTING_COMMAND (1<<30) /* Used to handle reentrency cases in processCommandWhileBlocked 
+                                            to ensure we don't process a client already executing */
 #define CLIENT_TRACKING (1ULL<<31) /* Client enabled keys tracking in order to
                                    perform client side caching. */
 #define CLIENT_TRACKING_BROKEN_REDIR (1ULL<<32) /* Target client is invalid. */
@@ -1389,6 +1387,8 @@ struct redisServerThreadVars {
     char neterr[ANET_ERR_LEN];   /* Error buffer for anet.c */
     long unsigned commandsExecuted = 0;
     bool fRetrySetAofEvent = false;
+    bool modulesEnabledThisAeLoop = false; /* In this loop of aeMain, were modules enabled before 
+                                              the thread went to sleep? */
     std::vector<client*> vecclientsProcess;
     dictAsyncRehashCtl *rehashCtl = nullptr;
 };
@@ -1492,6 +1492,7 @@ struct redisServer {
     ::dict *orig_commands;        /* Command table before command renaming. */
 
     struct redisServerThreadVars rgthreadvar[MAX_EVENT_LOOPS];
+    struct redisServerThreadVars modulethreadvar; /* Server thread local variables to be used by module threads */
     pthread_t rgthread[MAX_EVENT_LOOPS];
 
     std::atomic<unsigned int> lruclock;      /* Clock for LRU eviction */
